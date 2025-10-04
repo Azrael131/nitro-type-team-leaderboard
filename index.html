@@ -296,22 +296,7 @@
   </div>
 <script>
 (function() {
-  // =========================
-  // Robust NitroType Skull Script
-  // - Loads large data.json (root with { meta, teams })
-  // - Dedupes teams by teamTag (fallback teamName) keeping latest exportedAtISO
-  // - Flattens roster to racer array (guards missing roster)
-  // - Builds stable top-100 leaderboards:
-  //    * Team races (racers)
-  //    * Longest member since (racers, oldest first)
-  //    * Most active (racers, most recent last race first)
-  //    * Team totals (stats.allTime)
-  // - Displays summary based on root meta.lastUpdatedISO (fallback computed)
-  // - Failsafes: retries on fetch, schema normalization, empty-data guards, ISO parsing fallbacks
-  // - Progress bar for load/parsing, Save Aggregated JSON
-  // =========================
-
-  // --------- DOM refs ---------
+  // DOM refs expected in the page
   const el = {
     lastUpdated: document.getElementById('lastUpdated'),
     teamsCount: document.getElementById('teamsCount'),
@@ -330,7 +315,7 @@
     reloadBtn: document.getElementById('reloadBtn')
   };
 
-  // --------- Tabs ---------
+  // Tabs
   document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -340,23 +325,15 @@
     });
   });
 
-  // --------- Utilities ---------
-  function normNumber(x) {
-    const n = Number(x);
-    return Number.isFinite(n) ? n : 0;
-  }
-  function textOrEmpty(s) {
-    return s == null ? '' : String(s);
-  }
-  function isoDateString(d) {
-    if (!(d instanceof Date) || isNaN(d.getTime())) return '—';
-    return d.toISOString().replace('T', ' ').slice(0, 19);
-  }
-  function byDesc(get) { return (a, b) => get(b) - get(a); }
-  function byAscDate(get) { return (a, b) => get(a) - get(b); }   // older first
-  function byDescDate(get){ return (a, b) => get(b) - get(a); }   // newer first
+  // Utilities
+  function normNumber(x) { const n = Number(x); return Number.isFinite(n) ? n : 0; }
+  function textOrEmpty(s) { return s == null ? '' : String(s); }
+  function isoDateString(d) { return (d instanceof Date && !isNaN(d)) ? d.toISOString().replace('T',' ').slice(0,19) : '—'; }
+  function byDesc(get) { return (a,b) => get(b) - get(a); }
+  function byAscDate(get) { return (a,b) => get(a) - get(b); }   // older first
+  function byDescDate(get) { return (a,b) => get(b) - get(a); }  // newer first
 
-  // Relative time parsing: supports "a/an/NN unit(s) ago", "just now", "never", leading "> "
+  // Relative time parser
   function parseRelativeTime(str) {
     if (!str) return new Date(0);
     const s = String(str).trim().toLowerCase();
@@ -367,24 +344,14 @@
     if (!m) return new Date(0);
     const qty = (m[1] === 'a' || m[1] === 'an') ? 1 : parseInt(m[1], 10);
     const unit = m[2];
-    const ms = {
-      second: 1000,
-      minute: 60 * 1000,
-      hour:   60 * 60 * 1000,
-      day:    24 * 60 * 60 * 1000,
-      week:   7 * 24 * 60 * 60 * 1000,
-      month:  30 * 24 * 60 * 60 * 1000, // approx
-      year:   365 * 24 * 60 * 60 * 1000
-    }[unit] || 0;
+    const ms = { second:1000, minute:60000, hour:3600000, day:86400000, week:604800000, month:2592000000, year:31536000000 }[unit] || 0;
     return new Date(Date.now() - qty * ms);
   }
 
-  // Team label for tables
-  function safeTeamLabel(team) {
-    return String(team.teamTag || team.teamName || 'Unknown').trim();
-  }
+  // Label helpers
+  function safeTeamLabel(t) { return String(t.teamTag || t.teamName || 'Unknown').trim(); }
 
-  // --------- Robust fetch with retries/backoff ---------
+  // Network with retries
   async function fetchTextWithRetries(url, tries = 3, baseDelay = 500) {
     let lastErr = null;
     for (let i = 0; i < tries; i++) {
@@ -400,7 +367,7 @@
     throw lastErr || new Error('Failed to fetch ' + url);
   }
 
-  // --------- Worker to parse big JSON off main thread ---------
+  // Worker for big JSON
   let worker;
   function ensureWorker() {
     if (worker) return worker;
@@ -420,9 +387,7 @@
           } else if (root && typeof root === 'object') {
             if (Array.isArray(root.teams)) {
               teams = root.teams;
-              ingestedCount = (root.meta && typeof root.meta.filesIngested === 'number')
-                ? root.meta.filesIngested
-                : root.teams.length;
+              ingestedCount = (root.meta && typeof root.meta.filesIngested === 'number') ? root.meta.filesIngested : root.teams.length;
               rootMetaLast = root.meta && root.meta.lastUpdatedISO ? root.meta.lastUpdatedISO : null;
             } else {
               teams = [root];
@@ -446,54 +411,113 @@
     return worker;
   }
 
-  // --------- Deduplication by teamTag (latest exportedAtISO) ---------
+  // Dedup by teamTag (latest exportedAtISO)
   function dedupeTeamsByLatest(rawTeams) {
     const index = new Map();
     for (const t of rawTeams) {
       const tag = t.teamTag || t.teamName || 'Unknown';
-      // exportedAtISO may exist at team level or nested meta
       const ts = Date.parse(t.exportedAtISO || t.meta?.exportedAtISO || 0) || 0;
-      const current = index.get(tag);
-      if (!current || ts >= current.ts) {
-        index.set(tag, { team: t, ts });
-      }
+      const cur = index.get(tag);
+      if (!cur || ts >= cur.ts) index.set(tag, { team: t, ts });
     }
     return Array.from(index.values()).map(v => v.team);
   }
 
-  // --------- Flatten racers (guard missing roster) ---------
-  function flattenRacers(dedupedTeams) {
+  // Primary racer extraction from roster
+  function extractRosterRacers(team) {
+    const roster = Array.isArray(team.roster) ? team.roster : [];
+    const teamTag = textOrEmpty(team.teamTag);
+    return roster.map(m => ({
+      username: textOrEmpty(m.username),
+      teamTag: textOrEmpty(m.teamTag || teamTag),
+      memberSince: textOrEmpty(m.memberSince),
+      lastRace: textOrEmpty(m.lastRace),
+      teamRaces: normNumber(m.teamRaces),
+      totalRaces: normNumber(m.totalRaces),
+      avgWPM: normNumber(m.avgWPM),
+      highSpeed: normNumber(m.highSpeed),
+      source: 'roster'
+    }));
+  }
+
+  // Fallback inference from stats.raw
+  function inferRacersFromStatsRaw(team) {
+    const raw = team.stats?.raw || {};
+    const teamTag = textOrEmpty(team.teamTag);
+    const badKeys = new Set([
+      'All Time', 'Last 24 Hours', 'Last24Hours', 'Last 24 Hour', '1', '2', '3'
+    ]);
     const racers = [];
-    for (const t of dedupedTeams) {
-      const roster = Array.isArray(t.roster) ? t.roster : [];
-      const teamTag = textOrEmpty(t.teamTag);
-      for (const m of roster) {
-        racers.push({
-          username: textOrEmpty(m.username),
-          teamTag: textOrEmpty(m.teamTag || teamTag),
-          memberSince: textOrEmpty(m.memberSince),
-          lastRace: textOrEmpty(m.lastRace),
-          teamRaces: normNumber(m.teamRaces),
-          totalRaces: normNumber(m.totalRaces),
-          avgWPM: normNumber(m.avgWPM),
-          highSpeed: normNumber(m.highSpeed)
-        });
-      }
+    for (const [key, val] of Object.entries(raw)) {
+      if (!key) continue;
+      const k = String(key).trim();
+      if (badKeys.has(k)) continue;
+      if (/^\d+$/.test(k)) continue; // numbered block
+      if (!val || typeof val !== 'object') continue;
+
+      const avgSpeed = normNumber(val.avgSpeed);
+      const avgAccuracy = normNumber(val.avgAccuracy);
+      const hasData = Number.isFinite(avgSpeed) || Number.isFinite(avgAccuracy);
+      if (!hasData) continue;
+
+      racers.push({
+        username: k,               // inferred username label
+        teamTag,                   // assume current team
+        memberSince: '',           // unknown in raw
+        lastRace: '',              // unknown in raw
+        teamRaces: 0,              // not available in raw
+        totalRaces: 0,             // not available in raw
+        avgWPM: avgSpeed,          // map avgSpeed -> avgWPM proxy
+        highSpeed: 0,              // unknown
+        source: 'stats.raw'
+      });
     }
     return racers;
   }
 
-  // --------- Aggregation ---------
+  // Merge duplicates (username+teamTag)
+  function mergeRacers(racers) {
+    const index = new Map();
+    for (const r of racers) {
+      const key = `${r.username}::${r.teamTag}`;
+      const prev = index.get(key);
+      if (!prev) {
+        index.set(key, r);
+      } else {
+        // Prefer roster values; merge numerics by max
+        const better = (prev.source === 'roster') ? prev : r;
+        index.set(key, {
+          username: better.username || prev.username || r.username,
+          teamTag: better.teamTag || prev.teamTag || r.teamTag,
+          memberSince: better.memberSince || prev.memberSince || r.memberSince,
+          lastRace: better.lastRace || prev.lastRace || r.lastRace,
+          teamRaces: Math.max(prev.teamRaces || 0, r.teamRaces || 0),
+          totalRaces: Math.max(prev.totalRaces || 0, r.totalRaces || 0),
+          avgWPM: Math.max(prev.avgWPM || 0, r.avgWPM || 0),
+          highSpeed: Math.max(prev.highSpeed || 0, r.highSpeed || 0),
+          source: (prev.source === 'roster' || r.source === 'roster') ? 'roster' : 'stats.raw'
+        });
+      }
+    }
+    return Array.from(index.values());
+  }
+
+  // Build aggregated object for saving and previews
   function buildAggregated(rawTeams, ingestedCount, rootMetaLast) {
     const deduped = dedupeTeamsByLatest(rawTeams);
-    const racers = flattenRacers(deduped);
 
-    // Compute lastUpdatedISO: prefer root meta, else max team export stamp
+    // Extract racers (roster + inference)
+    const rosterRacers = deduped.flatMap(extractRosterRacers);
+    const inferredRacers = deduped.flatMap(inferRacersFromStatsRaw);
+    const racers = mergeRacers([...rosterRacers, ...inferredRacers]);
+
+    // Compute lastUpdatedISO
     const teamStamps = deduped
       .map(t => Date.parse(t.exportedAtISO || t.meta?.exportedAtISO || 0) || 0)
       .filter(ts => ts > 0);
     const lastUpdatedISO = rootMetaLast || (teamStamps.length ? new Date(Math.max(...teamStamps)).toISOString() : null);
 
+    // Normalize teams
     const teamsOut = deduped.map(t => ({
       teamTag: textOrEmpty(t.teamTag),
       teamName: textOrEmpty(t.teamName),
@@ -525,6 +549,8 @@
         filesIngested: ingestedCount,
         teamsDeduped: teamsOut.length,
         racersTotal: racers.length,
+        inferredRacers: inferredRacers.length,
+        rosterRacers: rosterRacers.length,
         lastUpdatedISO
       },
       teams: teamsOut,
@@ -532,10 +558,10 @@
     };
   }
 
-  // --------- Rendering (summary + leaderboards + previews) ---------
+  // Rendering
   function renderSummary(meta) {
     el.teamsCount.textContent = `Teams: ${meta.teamsDeduped}`;
-    el.racersCount.textContent = `Racers: ${meta.racersTotal.toLocaleString()}`;
+    el.racersCount.textContent = `Racers: ${meta.racersTotal.toLocaleString()} (roster: ${meta.rosterRacers}, inferred: ${meta.inferredRacers})`;
     el.exportsCount.textContent = `Exports ingested: ${meta.filesIngested}`;
     el.lastUpdated.textContent = `Last updated: ${meta.lastUpdatedISO ? new Date(meta.lastUpdatedISO).toLocaleString() : '—'}`;
   }
@@ -543,7 +569,7 @@
     tbody.innerHTML = rows.slice(0, 100).map(rowMap).join('');
   }
 
-  // Team races (racers)
+  // Leaderboards
   function renderRacerTeamRaces(racers) {
     const top = racers.slice().sort(byDesc(r => r.teamRaces));
     renderTop100(el.tbodyRacerTeamRaces, top, (r, i) => `
@@ -555,8 +581,6 @@
       </tr>
     `);
   }
-
-  // Longest member since: oldest first by parsed memberSince
   function renderTenure(racers) {
     const enriched = racers.map(r => ({ r, sinceDate: parseRelativeTime(r.memberSince) }));
     const top = enriched.slice().sort(byAscDate(x => x.sinceDate));
@@ -570,8 +594,6 @@
       </tr>
     `);
   }
-
-  // Most active: most recent last race first by parsed lastRace
   function renderActive(racers) {
     const enriched = racers.map(r => ({ r, lastDate: parseRelativeTime(r.lastRace) }));
     const top = enriched.slice().sort(byDescDate(x => x.lastDate));
@@ -585,8 +607,6 @@
       </tr>
     `);
   }
-
-  // Team totals: stats.allTime
   function renderTeamTotals(teams) {
     const rows = teams.map(t => ({
       team: safeTeamLabel(t),
@@ -608,7 +628,7 @@
     `);
   }
 
-  // Previews (first 50 racers + teams)
+  // Previews
   function renderPreviews(agg) {
     const sample = agg.racers.slice(0, 50);
     el.previewRacers.innerHTML = sample.map((r, i) => `
@@ -641,7 +661,7 @@
     `).join('');
   }
 
-  // --------- Save aggregated JSON ---------
+  // Save aggregated
   let aggregated = null;
   function saveAggregatedJSON() {
     if (!aggregated) return;
@@ -655,9 +675,8 @@
     URL.revokeObjectURL(url);
   }
 
-  // --------- Load + render pipeline with failsafes ---------
+  // Load + render pipeline
   async function loadAndRender() {
-    // UI reset
     el.errorBox.style.display = 'none';
     el.progress.style.display = 'block';
     el.progressBar.style.width = '0%';
@@ -666,7 +685,7 @@
 
     let text = '';
     try {
-      text = await fetchTextWithRetries('data.json', 3, 500);
+      text = await fetchTextWithRetries('data.json', 3, 600);
     } catch (e) {
       el.errorBox.style.display = 'block';
       el.errorBox.textContent = 'Failed to load data.json: ' + (e.message || String(e));
@@ -712,11 +731,10 @@
     w.postMessage({ text });
   }
 
-  // --------- Bind actions + auto-load ---------
+  // Bind actions + autoload
   el.reloadBtn.addEventListener('click', loadAndRender);
   el.saveBtn.addEventListener('click', saveAggregatedJSON);
   loadAndRender();
-
 })();
 </script>
 </body>
