@@ -237,414 +237,484 @@
     </div>
   </div>
 
-  <script>
-    // Tabs
-    document.querySelectorAll('.tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-        tab.classList.add('active');
-        document.getElementById(tab.dataset.tab).classList.add('active');
+<script>
+/**
+ * NitroType Leaderboards (Robust Skull) — Script
+ * ---------------------------------------------------------------
+ * Loads data.json, normalizes teams, aggregates racers from root.racers
+ * (preferred) and team.roster (fallback), dedupes teams by teamTag keeping
+ * latest export, and renders top-100 leaderboards:
+ *   - Team races (racers)
+ *   - Longest member since (racers)
+ *   - Most active (racers)
+ *   - Team total races (stats.allTime)
+ *
+ * Important: We DO NOT infer racers from stats.raw username keys.
+ * We use only explicit racer objects from:
+ *   - root.racers (full list across all teams), or
+ *   - team.roster (per-team roster array) when root.racers is missing.
+ *
+ * UI elements expected (from your HTML):
+ *   - Summary badges: #teamsCount, #racersCount, #exportsCount, #lastUpdated
+ *   - Controls: #reloadBtn, #saveJSON
+ *   - Error/progress: #errorBox, #progress, #progressBar
+ *   - Leaderboard tbody ids:
+ *       #tbody-racer-teamRaces, #tbody-tenure, #tbody-active, #tbody-team-totals
+ */
+
+/* ----------------------- Tabs ----------------------- */
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.tab).classList.add('active');
+  });
+});
+
+/* ----------------------- DOM refs ----------------------- */
+const el = {
+  lastUpdated: document.getElementById('lastUpdated'),
+  teamsCount: document.getElementById('teamsCount'),
+  racersCount: document.getElementById('racersCount'),
+  exportsCount: document.getElementById('exportsCount'),
+  errorBox: document.getElementById('errorBox'),
+  progress: document.getElementById('progress'),
+  progressBar: document.getElementById('progressBar'),
+  tbodyRacerTeamRaces: document.getElementById('tbody-racer-teamRaces'),
+  tbodyTenure: document.getElementById('tbody-tenure'),
+  tbodyActive: document.getElementById('tbody-active'),
+  tbodyTeamTotals: document.getElementById('tbody-team-totals'),
+  saveBtn: document.getElementById('saveJSON'),
+  reloadBtn: document.getElementById('reloadBtn')
+};
+
+/* ----------------------- Utilities ----------------------- */
+/**
+ * Robust numeric parser:
+ * - Handles numbers and strings with commas/spaces or stray characters.
+ * - Keeps minus and decimal point.
+ */
+function toNum(x) {
+  if (x == null) return 0;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : 0;
+  const s = String(x).trim().replace(/[, ]+/g, '').replace(/[^\d.-]/g, '');
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+function textOrEmpty(s) { return (s == null) ? '' : String(s); }
+function isoDateString(d) { return (d instanceof Date && !isNaN(d)) ? d.toISOString().replace('T',' ').slice(0,19) : '—'; }
+function byDesc(get) { return (a,b) => get(b) - get(a); }      // numeric desc
+function byAscDate(get) { return (a,b) => get(a) - get(b); }   // older first
+function byDescDate(get){ return (a,b) => get(b) - get(a); }   // newer first
+
+/**
+ * Parse relative time strings into approximate Date.
+ * Supports: "a|an|NN unit(s) ago", "just now", "never", optional leading "> ".
+ */
+function parseRelativeTime(str) {
+  if (!str) return new Date(0);
+  const s = String(str).trim().toLowerCase();
+  if (s === 'never') return new Date(0);
+  if (s === 'just now') return new Date();
+  const cleaned = s.replace(/^>\s*/, '').replace(/\s+/g, ' ');
+  const m = cleaned.match(/^(a|an|\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/);
+  if (!m) return new Date(0);
+  const qty = (m[1] === 'a' || m[1] === 'an') ? 1 : parseInt(m[1], 10);
+  const unit = m[2];
+  const ms = { second:1e3, minute:6e4, hour:36e5, day:864e5, week:6048e5, month:2592e6, year:31536e6 }[unit] || 0;
+  return new Date(Date.now() - qty * ms);
+}
+
+/* ----------------------- Normalization ----------------------- */
+/**
+ * Normalize a team to consistent shape.
+ * Accepts objects with fields under header/meta/info/stats or top-level.
+ * Keeps roster array as-is; we parse its fields later with toNum().
+ */
+function normalizeTeam(raw) {
+  const hdr   = raw?.header || {};
+  const meta  = raw?.meta   || {};
+  const info  = raw?.info   || {};
+  const stats = raw?.stats  || {};
+  const roster= Array.isArray(raw?.roster) ? raw.roster : [];
+
+  return {
+    teamTag: textOrEmpty(hdr.teamTag || raw.teamTag),
+    teamName: textOrEmpty(hdr.teamName || raw.teamName),
+    href: textOrEmpty(meta.href || raw.href),
+    exportedAtISO: textOrEmpty(meta.exportedAtISO || raw.exportedAtISO),
+
+    info: {
+      members: toNum(info.members),
+      formed: textOrEmpty(info.formed),
+      pageViews: toNum(info.pageViews),
+      raw: info.raw || {}
+    },
+
+    stats: {
+      last24Hours: {
+        races: toNum(stats?.last24Hours?.races),
+        avgSpeed: toNum(stats?.last24Hours?.avgSpeed),
+        avgAccuracy: toNum(stats?.last24Hours?.avgAccuracy)
+      },
+      allTime: {
+        races: toNum(stats?.allTime?.races),
+        avgSpeed: toNum(stats?.allTime?.avgSpeed),
+        avgAccuracy: toNum(stats?.allTime?.avgAccuracy)
+      },
+      raw: stats?.raw || {} // never used to infer racers
+    },
+
+    roster
+  };
+}
+
+/**
+ * Deduplicate teams by teamTag (fallback teamName), keeping latest export.
+ */
+function dedupeTeamsByLatest(rawTeams) {
+  const index = new Map();
+  for (const raw of rawTeams) {
+    const t = normalizeTeam(raw);
+    const tag = t.teamTag || t.teamName || 'Unknown';
+    const ts  = Date.parse(t.exportedAtISO || 0) || 0;
+    const curr = index.get(tag);
+    if (!curr || ts >= curr.ts) index.set(tag, { team: t, ts });
+  }
+  return Array.from(index.values()).map(x => x.team);
+}
+
+/* ----------------------- Racers aggregation ----------------------- */
+/**
+ * Flatten team.roster into unified racer objects (fallback source).
+ */
+function flattenRostersToRacers(dedupedTeams) {
+  const out = [];
+  for (const t of dedupedTeams) {
+    for (const m of t.roster) {
+      out.push({
+        username: textOrEmpty(m?.username),
+        teamTag: textOrEmpty(m?.teamTag || t.teamTag),
+        avgWPM: toNum(m?.avgWPM),
+        highSpeed: toNum(m?.highSpeed),
+        totalRaces: toNum(m?.totalRaces),
+        teamRaces: toNum(m?.teamRaces),
+        memberSince: textOrEmpty(m?.memberSince),
+        lastRace: textOrEmpty(m?.lastRace)
       });
-    });
+    }
+  }
+  return out;
+}
 
-    // DOM refs
-    const el = {
-      lastUpdated: document.getElementById('lastUpdated'),
-      teamsCount: document.getElementById('teamsCount'),
-      racersCount: document.getElementById('racersCount'),
-      exportsCount: document.getElementById('exportsCount'),
-      errorBox: document.getElementById('errorBox'),
-      progress: document.getElementById('progress'),
-      progressBar: document.getElementById('progressBar'),
-      tbodyRacerTeamRaces: document.getElementById('tbody-racer-teamRaces'),
-      tbodyTenure: document.getElementById('tbody-tenure'),
-      tbodyActive: document.getElementById('tbody-active'),
-      tbodyTeamTotals: document.getElementById('tbody-team-totals'),
-      saveBtn: document.getElementById('saveJSON'),
-      reloadBtn: document.getElementById('reloadBtn')
+/**
+ * Merge racers from root.racers (preferred) and roster racers (fallback).
+ * Dedupes by username+teamTag, preferring root.racers fields when present,
+ * and numerics are merged via max to avoid losing stronger signals.
+ */
+function mergeRacers(rootRacers, rosterRacers) {
+  const index = new Map();
+
+  function put(r, source) {
+    const key = `${String(r.username || '').trim()}::${String(r.teamTag || '').trim()}`;
+    const prev = index.get(key);
+    const normalized = {
+      username: String(r.username || '').trim(),
+      teamTag: String(r.teamTag || '').trim(),
+      avgWPM: toNum(r.avgWPM),
+      highSpeed: toNum(r.highSpeed),
+      totalRaces: toNum(r.totalRaces),
+      teamRaces: toNum(r.teamRaces),
+      memberSince: String(r.memberSince || '').trim(),
+      lastRace: String(r.lastRace || '').trim(),
+      _source: source
     };
-
-    // Helpers
-    function toNum(x) {
-      if (x == null) return 0;
-      if (typeof x === 'number') return Number.isFinite(x) ? x : 0;
-      const s = String(x).trim().replace(/[, ]+/g, '').replace(/[^\d.-]/g, '');
-      const n = Number(s);
-      return Number.isFinite(n) ? n : 0;
+    if (!prev) {
+      index.set(key, normalized);
+    } else {
+      const rootWins = prev._source === 'root' || source === 'root';
+      index.set(key, {
+        username: normalized.username || prev.username,
+        teamTag: normalized.teamTag || prev.teamTag,
+        avgWPM: Math.max(prev.avgWPM, normalized.avgWPM),
+        highSpeed: Math.max(prev.highSpeed, normalized.highSpeed),
+        totalRaces: Math.max(prev.totalRaces, normalized.totalRaces),
+        teamRaces: Math.max(prev.teamRaces, normalized.teamRaces),
+        memberSince: rootWins ? (normalized.memberSince || prev.memberSince) : (prev.memberSince || normalized.memberSince),
+        lastRace: rootWins ? (normalized.lastRace || prev.lastRace) : (prev.lastRace || normalized.lastRace),
+        _source: rootWins ? 'root' : (prev._source || source)
+      });
     }
-    function textOrEmpty(s) { return (s == null) ? '' : String(s); }
-    function isoDateString(d) { return (d instanceof Date && !isNaN(d)) ? d.toISOString().replace('T',' ').slice(0,19) : '—'; }
-    function byDesc(get) { return (a,b) => get(b) - get(a); }
-    function byAscDate(get) { return (a,b) => get(a) - get(b); }
-    function byDescDate(get) { return (a,b) => get(b) - get(a); }
+  }
 
-    function parseRelativeTime(str) {
-      if (!str) return new Date(0);
-      const s = String(str).trim().toLowerCase();
-      if (s === 'never') return new Date(0);
-      if (s === 'just now') return new Date();
-      const cleaned = s.replace(/^>\s*/, '').replace(/\s+/g, ' ');
-      const m = cleaned.match(/^(a|an|\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/);
-      if (!m) return new Date(0);
-      const qty = (m[1] === 'a' || m[1] === 'an') ? 1 : parseInt(m[1], 10);
-      const unit = m[2];
-      const ms = { second:1e3, minute:6e4, hour:36e5, day:864e5, week:6048e5, month:2592e6, year:31536e6 }[unit] || 0;
-      return new Date(Date.now() - qty * ms);
+  for (const r of rootRacers) put(r, 'root');
+  for (const r of rosterRacers) put(r, 'roster');
+
+  return Array.from(index.values()).map(({ _source, ...rest }) => rest);
+}
+
+/* ----------------------- Aggregation ----------------------- */
+/**
+ * Build aggregated dataset:
+ * - deduped teams
+ * - merged racers: root.racers preferred, roster fallback
+ * - meta lastUpdatedISO from root meta or max team export
+ */
+function buildAggregated(rawTeams, ingestedCount = null, rootMetaLast = null, rootRacers = []) {
+  const deduped = dedupeTeamsByLatest(rawTeams);
+  const rosterRacers = flattenRostersToRacers(deduped);
+
+  // Merge root-level racers (preferred) with roster fallback
+  const racers = mergeRacers(Array.isArray(rootRacers) ? rootRacers : [], rosterRacers);
+
+  const stamps = deduped.map(t => Date.parse(t.exportedAtISO || 0) || 0).filter(ts => ts > 0);
+  const lastUpdatedISO = rootMetaLast || (stamps.length ? new Date(Math.max(...stamps)).toISOString() : null);
+
+  return {
+    meta: {
+      filesIngested: ingestedCount != null ? ingestedCount : rawTeams.length,
+      teamsDeduped: deduped.length,
+      racersTotal: racers.length,
+      lastUpdatedISO
+    },
+    teams: deduped,
+    racers
+  };
+}
+
+/* ----------------------- Rendering ----------------------- */
+function renderSummary(meta) {
+  el.teamsCount.textContent  = `Teams (deduped): ${meta.teamsDeduped}`;
+  el.racersCount.textContent = `Racers: ${meta.racersTotal.toLocaleString()}`;
+  el.exportsCount.textContent= `Exports ingested: ${meta.filesIngested}`;
+  el.lastUpdated.textContent = `Last updated: ${meta.lastUpdatedISO ? new Date(meta.lastUpdatedISO).toLocaleString() : '—'}`;
+}
+
+function renderTop100(tbody, rows, rowMap) {
+  tbody.innerHTML = rows.slice(0, 100).map(rowMap).join('');
+}
+
+// Team races leaderboard (racers)
+function renderRacerTeamRaces(racers) {
+  const top = racers.slice().sort(byDesc(r => r.teamRaces));
+  renderTop100(el.tbodyRacerTeamRaces, top, (r, i) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td>${r.username}</td>
+      <td>${r.teamTag}</td>
+      <td class="num">${r.teamRaces.toLocaleString()}</td>
+    </tr>
+  `);
+}
+
+// Longest member since: oldest first by parsed memberSince
+function renderTenure(racers) {
+  const enriched = racers.map(r => ({ r, sinceDate: parseRelativeTime(r.memberSince) }));
+  const top = enriched.slice().sort(byAscDate(x => x.sinceDate));
+  renderTop100(el.tbodyTenure, top, (x, i) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td>${x.r.username}</td>
+      <td>${x.r.teamTag}</td>
+      <td>${x.r.memberSince || '—'}</td>
+      <td class="num">${isoDateString(x.sinceDate)}</td>
+    </tr>
+  `);
+}
+
+// Most active: most recent last race first by parsed lastRace
+function renderActive(racers) {
+  const enriched = racers.map(r => ({ r, lastDate: parseRelativeTime(r.lastRace) }));
+  const top = enriched.slice().sort(byDescDate(x => x.lastDate));
+  renderTop100(el.tbodyActive, top, (x, i) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td>${x.r.username}</td>
+      <td>${x.r.teamTag}</td>
+      <td>${x.r.lastRace || '—'}</td>
+      <td class="num">${isoDateString(x.lastDate)}</td>
+    </tr>
+  `);
+}
+
+// Team totals leaderboard (stats.allTime)
+function renderTeamTotals(teams) {
+  const rows = teams.map(t => ({
+    team: String(t.teamTag || t.teamName || 'Unknown'),
+    races: toNum(t.stats?.allTime?.races),
+    avgSpeed: toNum(t.stats?.allTime?.avgSpeed),
+    avgAccuracy: toNum(t.stats?.allTime?.avgAccuracy),
+    href: textOrEmpty(t.href)
+  }));
+  const top = rows.slice().sort(byDesc(r => r.races));
+  renderTop100(el.tbodyTeamTotals, top, (r, i) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td>${r.team}</td>
+      <td class="num">${r.races.toLocaleString()}</td>
+      <td class="num">${r.avgSpeed}</td>
+      <td class="num">${r.avgAccuracy}</td>
+      <td class="muted">${r.href ? `<a href="${r.href}" target="_blank" rel="noopener">${r.href}</a>` : '—'}</td>
+    </tr>
+  `);
+}
+
+/* ----------------------- Save ----------------------- */
+let aggregated = null;
+
+function enableSave(agg) {
+  aggregated = agg;
+  el.saveBtn.disabled = false;
+}
+
+function saveAggregatedJSON() {
+  if (!aggregated) return;
+  const stamp = (aggregated.meta.lastUpdatedISO || new Date().toISOString()).replace(/[:T]/g, '-').split('.')[0];
+  const blob = new Blob([JSON.stringify(aggregated, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url;
+  a.download = `nitrotype_aggregated_${stamp}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ----------------------- Fetch with retries ----------------------- */
+async function fetchTextWithRetries(url, tries = 3, baseDelay = 500) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return await res.text();
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, baseDelay * (i + 1)));
     }
+  }
+  throw lastErr || new Error('Failed to fetch ' + url);
+}
 
-    // Normalize a team into consistent shape
-    function normalizeTeam(raw) {
-      const hdr   = raw?.header || {};
-      const meta  = raw?.meta   || {};
-      const info  = raw?.info   || {};
-      const stats = raw?.stats  || {};
-      const roster= Array.isArray(raw?.roster) ? raw.roster : [];
+/* ----------------------- Worker for large JSON ----------------------- */
+let worker;
 
-      return {
-        teamTag: textOrEmpty(hdr.teamTag || raw.teamTag),
-        teamName: textOrEmpty(hdr.teamName || raw.teamName),
-        href: textOrEmpty(meta.href || raw.href),
-        exportedAtISO: textOrEmpty(meta.exportedAtISO || raw.exportedAtISO),
-
-        info: {
-          members: toNum(info.members),
-          formed: textOrEmpty(info.formed),
-          pageViews: toNum(info.pageViews),
-          raw: info.raw || {}
-        },
-
-        stats: {
-          last24Hours: {
-            races: toNum(stats?.last24Hours?.races),
-            avgSpeed: toNum(stats?.last24Hours?.avgSpeed),
-            avgAccuracy: toNum(stats?.last24Hours?.avgAccuracy)
-          },
-          allTime: {
-            races: toNum(stats?.allTime?.races),
-            avgSpeed: toNum(stats?.allTime?.avgSpeed),
-            avgAccuracy: toNum(stats?.allTime?.avgAccuracy)
-          },
-          raw: stats?.raw || {} // not used for racers
-        },
-
-        roster
-      };
-    }
-
-    // Dedupe teams by tag, keep latest export
-    function dedupeTeamsByLatest(rawTeams) {
-      const index = new Map();
-      for (const raw of rawTeams) {
-        const t = normalizeTeam(raw);
-        const tag = t.teamTag || t.teamName || 'Unknown';
-        const ts  = Date.parse(t.exportedAtISO || 0) || 0;
-        const curr = index.get(tag);
-        if (!curr || ts >= curr.ts) index.set(tag, { team: t, ts });
-      }
-      return Array.from(index.values()).map(x => x.team);
-    }
-
-    // Flatten roster into racers
-    function flattenRostersToRacers(deduped) {
-      const out = [];
-      for (const t of deduped) {
-        for (const m of t.roster) {
-          out.push({
-            username: textOrEmpty(m?.username),
-            teamTag: textOrEmpty(m?.teamTag || t.teamTag),
-            avgWPM: toNum(m?.avgWPM),
-            highSpeed: toNum(m?.highSpeed),
-            totalRaces: toNum(m?.totalRaces),
-            teamRaces: toNum(m?.teamRaces),
-            memberSince: textOrEmpty(m?.memberSince),
-            lastRace: textOrEmpty(m?.lastRace)
-          });
-        }
-      }
-      return out;
-    }
-
-    // Merge root.racers with roster racers (prefer roster values)
-    function mergeRacers(rosterRacers, rootRacers) {
-      const index = new Map();
-      const put = (r, source) => {
-        const key = `${String(r.username||'').trim()}::${String(r.teamTag||'').trim()}`;
-        const prev = index.get(key);
-        const normalized = {
-          username: String(r.username||'').trim(),
-          teamTag: String(r.teamTag||'').trim(),
-          avgWPM: toNum(r.avgWPM),
-          highSpeed: toNum(r.highSpeed),
-          totalRaces: toNum(r.totalRaces),
-          teamRaces: toNum(r.teamRaces),
-          memberSince: String(r.memberSince||'').trim(),
-          lastRace: String(r.lastRace||'').trim(),
-          _source: source
-        };
-        if (!prev) {
-          index.set(key, normalized);
-        } else {
-          const rosterWins = prev._source === 'roster' || source === 'roster';
-          index.set(key, {
-            username: normalized.username || prev.username,
-            teamTag: normalized.teamTag || prev.teamTag,
-            avgWPM: Math.max(prev.avgWPM, normalized.avgWPM),
-            highSpeed: Math.max(prev.highSpeed, normalized.highSpeed),
-            totalRaces: Math.max(prev.totalRaces, normalized.totalRaces),
-            teamRaces: Math.max(prev.teamRaces, normalized.teamRaces),
-            memberSince: rosterWins ? (normalized.memberSince || prev.memberSince) : (prev.memberSince || normalized.memberSince),
-            lastRace: rosterWins ? (normalized.lastRace || prev.lastRace) : (prev.lastRace || normalized.lastRace),
-            _source: rosterWins ? 'roster' : (prev._source || source)
-          });
-        }
-      };
-      for (const r of rosterRacers) put(r, 'roster');
-      for (const r of rootRacers) put(r, 'root');
-      return Array.from(index.values()).map(({ _source, ...rest }) => rest);
-    }
-
-    // Build aggregated
-    function buildAggregated(rawTeams, ingestedCount = null, rootMetaLast = null, rootRacers = []) {
-      const deduped = dedupeTeamsByLatest(rawTeams);
-      const rosterRacers = flattenRostersToRacers(deduped);
-      const racers = mergeRacers(rosterRacers, rootRacers);
-
-      const stamps = deduped.map(t => Date.parse(t.exportedAtISO || 0) || 0).filter(ts => ts > 0);
-      const lastUpdatedISO = rootMetaLast || (stamps.length ? new Date(Math.max(...stamps)).toISOString() : null);
-
-      return {
-        meta: {
-          filesIngested: ingestedCount != null ? ingestedCount : rawTeams.length,
-          teamsDeduped: deduped.length,
-          racersTotal: racers.length,
-          lastUpdatedISO
-        },
-        teams: deduped,
-        racers
-      };
-    }
-
-    // Rendering
-    function renderSummary(meta) {
-      el.teamsCount.textContent  = `Teams (deduped): ${meta.teamsDeduped}`;
-      el.racersCount.textContent = `Racers: ${meta.racersTotal.toLocaleString()}`;
-      el.exportsCount.textContent= `Exports ingested: ${meta.filesIngested}`;
-      el.lastUpdated.textContent = `Last updated: ${meta.lastUpdatedISO ? new Date(meta.lastUpdatedISO).toLocaleString() : '—'}`;
-    }
-
-    function renderTop100(tbody, rows, rowMap) {
-      tbody.innerHTML = rows.slice(0, 100).map(rowMap).join('');
-    }
-
-    function renderRacerTeamRaces(racers) {
-      const top = racers.slice().sort(byDesc(r => r.teamRaces));
-      renderTop100(el.tbodyRacerTeamRaces, top, (r, i) => `
-        <tr>
-          <td class="num">${i + 1}</td>
-          <td>${r.username}</td>
-          <td>${r.teamTag}</td>
-          <td class="num">${r.teamRaces.toLocaleString()}</td>
-        </tr>
-      `);
-    }
-
-    function renderTenure(racers) {
-      const enriched = racers.map(r => ({ r, sinceDate: parseRelativeTime(r.memberSince) }));
-      const top = enriched.slice().sort(byAscDate(x => x.sinceDate));
-      renderTop100(el.tbodyTenure, top, (x, i) => `
-        <tr>
-          <td class="num">${i + 1}</td>
-          <td>${x.r.username}</td>
-          <td>${x.r.teamTag}</td>
-          <td>${x.r.memberSince || '—'}</td>
-          <td class="num">${isoDateString(x.sinceDate)}</td>
-        </tr>
-      `);
-    }
-
-    function renderActive(racers) {
-      const enriched = racers.map(r => ({ r, lastDate: parseRelativeTime(r.lastRace) }));
-      const top = enriched.slice().sort(byDescDate(x => x.lastDate));
-      renderTop100(el.tbodyActive, top, (x, i) => `
-        <tr>
-          <td class="num">${i + 1}</td>
-          <td>${x.r.username}</td>
-          <td>${x.r.teamTag}</td>
-          <td>${x.r.lastRace || '—'}</td>
-          <td class="num">${isoDateString(x.lastDate)}</td>
-        </tr>
-      `);
-    }
-
-    function renderTeamTotals(teams) {
-      const rows = teams.map(t => ({
-        team: String(t.teamTag || t.teamName || 'Unknown'),
-        races: toNum(t.stats?.allTime?.races),
-        avgSpeed: toNum(t.stats?.allTime?.avgSpeed),
-        avgAccuracy: toNum(t.stats?.allTime?.avgAccuracy),
-        href: textOrEmpty(t.href)
-      }));
-      const top = rows.slice().sort(byDesc(r => r.races));
-      renderTop100(el.tbodyTeamTotals, top, (r, i) => `
-        <tr>
-          <td class="num">${i + 1}</td>
-          <td>${r.team}</td>
-          <td class="num">${r.races.toLocaleString()}</td>
-          <td class="num">${r.avgSpeed}</td>
-          <td class="num">${r.avgAccuracy}</td>
-          <td class="muted">${r.href ? `<a href="${r.href}" target="_blank" rel="noopener">${r.href}</a>` : '—'}</td>
-        </tr>
-      `);
-    }
-
-    // Save
-    let aggregated = null;
-    function enableSave(agg) {
-      aggregated = agg;
-      el.saveBtn.disabled = false;
-    }
-    function saveAggregatedJSON() {
-      if (!aggregated) return;
-      const stamp = (aggregated.meta.lastUpdatedISO || new Date().toISOString()).replace(/[:T]/g, '-').split('.')[0];
-      const blob = new Blob([JSON.stringify(aggregated, null, 2)], { type: 'application/json' });
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement('a');
-      a.href = url;
-      a.download = `nitrotype_aggregated_${stamp}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-    }
-
-    // Fetch with retries
-    async function fetchTextWithRetries(url, tries = 3, baseDelay = 500) {
-      let lastErr = null;
-      for (let i = 0; i < tries; i++) {
-        try {
-          const res = await fetch(url, { cache: 'no-store' });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          return await res.text();
-        } catch (e) {
-          lastErr = e;
-          await new Promise(r => setTimeout(r, baseDelay * (i + 1)));
-        }
-      }
-      throw lastErr || new Error('Failed to fetch ' + url);
-    }
-
-    // Worker: forwards teams and root.racers when present
-    let worker;
-    function ensureWorker() {
-      if (worker) return worker;
-      const code = `
-        self.onmessage = (ev) => {
-          const { text } = ev.data || {};
-          try {
-            const root = JSON.parse(text);
-
-            let teams = [];
-            let rootRacers = [];
-            let ingestedCount = 0;
-            let rootMetaLast = null;
-
-            if (Array.isArray(root)) {
-              teams = root;
-              ingestedCount = root.length;
-            } else if (root && typeof root === 'object') {
-              if (Array.isArray(root.teams)) {
-                teams = root.teams;
-                ingestedCount = (root.meta && typeof root.meta.filesIngested === 'number')
-                  ? root.meta.filesIngested
-                  : root.teams.length;
-                rootMetaLast = root.meta && root.meta.lastUpdatedISO ? root.meta.lastUpdatedISO : null;
-              } else {
-                teams = [root];
-                ingestedCount = 1;
-              }
-              if (Array.isArray(root.racers)) {
-                rootRacers = root.racers;
-              }
-            }
-
-            const CHUNK = 300;
-            for (let i = 0; i < teams.length; i += CHUNK) {
-              self.postMessage({ type: 'progress', processed: Math.min(i + CHUNK, teams.length), total: teams.length });
-            }
-
-            self.postMessage({ type: 'done', teams, rootRacers, ingestedCount, rootMetaLast });
-          } catch (e) {
-            self.postMessage({ type: 'error', message: e.message || String(e) });
-          }
-        };
-      `;
-      const blob = new Blob([code], { type: 'application/javascript' });
-      worker = new Worker(URL.createObjectURL(blob));
-      return worker;
-    }
-
-    // Skull loader (data.json)
-    async function loadAndRender() {
-      el.errorBox.style.display = 'none';
-      el.errorBox.textContent = '';
-      el.progress.style.display = 'block';
-      el.progressBar.style.width = '0%';
-      el.saveBtn.disabled = true;
-      aggregated = null;
-
-      let text = '';
+function ensureWorker() {
+  if (worker) return worker;
+  const code = `
+    self.onmessage = (ev) => {
+      const { text } = ev.data || {};
       try {
-        text = await fetchTextWithRetries('data.json', 3, 600);
+        const root = JSON.parse(text);
+
+        let teams = [];
+        let rootRacers = [];
+        let ingestedCount = 0;
+        let rootMetaLast = null;
+
+        if (Array.isArray(root)) {
+          // If root is an array, treat as teams array (legacy style)
+          teams = root;
+          ingestedCount = root.length;
+        } else if (root && typeof root === 'object') {
+          if (Array.isArray(root.teams)) {
+            teams = root.teams;
+            ingestedCount = (root.meta && typeof root.meta.filesIngested === 'number')
+              ? root.meta.filesIngested
+              : root.teams.length;
+            rootMetaLast = root.meta && root.meta.lastUpdatedISO ? root.meta.lastUpdatedISO : null;
+          } else {
+            teams = [root];
+            ingestedCount = 1;
+            rootMetaLast = root.meta && root.meta.lastUpdatedISO ? root.meta.lastUpdatedISO : null;
+          }
+          if (Array.isArray(root.racers)) {
+            rootRacers = root.racers;
+          }
+        }
+
+        const CHUNK = 300;
+        for (let i = 0; i < teams.length; i += CHUNK) {
+          self.postMessage({ type: 'progress', processed: Math.min(i + CHUNK, teams.length), total: teams.length });
+        }
+
+        self.postMessage({ type: 'done', teams, rootRacers, ingestedCount, rootMetaLast });
+      } catch (e) {
+        self.postMessage({ type: 'error', message: e.message || String(e) });
+      }
+    };
+  `;
+  const blob = new Blob([code], { type: 'application/javascript' });
+  worker = new Worker(URL.createObjectURL(blob));
+  return worker;
+}
+
+/* ----------------------- Loader (data.json) ----------------------- */
+async function loadAndRender() {
+  // Reset UI state
+  el.errorBox.style.display = 'none';
+  el.errorBox.textContent = '';
+  el.progress.style.display = 'block';
+  el.progressBar.style.width = '0%';
+  el.saveBtn.disabled = true;
+  aggregated = null;
+
+  // Fetch text with retries
+  let text = '';
+  try {
+    text = await fetchTextWithRetries('data.json', 3, 600);
+  } catch (e) {
+    el.errorBox.style.display = 'block';
+    el.errorBox.textContent = 'Failed to load data.json: ' + (e.message || String(e));
+    el.progress.style.display = 'none';
+    return;
+  }
+
+  // Parse off main thread
+  const w = ensureWorker();
+  w.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'progress') {
+      const pct = msg.total ? Math.round((msg.processed / msg.total) * 100) : 100;
+      el.progressBar.style.width = pct + '%';
+    } else if (msg.type === 'error') {
+      el.errorBox.style.display = 'block';
+      el.errorBox.textContent = 'Parse error: ' + msg.message;
+      el.progress.style.display = 'none';
+    } else if (msg.type === 'done') {
+      try {
+        const rawTeams = Array.isArray(msg.teams) ? msg.teams : [];
+        const rootRacers = Array.isArray(msg.rootRacers) ? msg.rootRacers : [];
+        const ingestedCount = msg.ingestedCount || rawTeams.length;
+        const rootMetaLast = msg.rootMetaLast || null;
+
+        const agg = buildAggregated(rawTeams, ingestedCount, rootMetaLast, rootRacers);
+
+        renderSummary(agg.meta);
+        renderRacerTeamRaces(agg.racers);
+        renderTenure(agg.racers);
+        renderActive(agg.racers);
+        renderTeamTotals(agg.teams);
+
+        enableSave(agg);
+        el.progressBar.style.width = '100%';
+        setTimeout(() => { el.progress.style.display = 'none'; }, 350);
       } catch (e) {
         el.errorBox.style.display = 'block';
-        el.errorBox.textContent = 'Failed to load data.json: ' + (e.message || String(e));
+        el.errorBox.textContent = 'Render error: ' + (e.message || String(e));
         el.progress.style.display = 'none';
-        return;
       }
-
-      const w = ensureWorker();
-      w.onmessage = (ev) => {
-        const msg = ev.data || {};
-        if (msg.type === 'progress') {
-          const pct = msg.total ? Math.round((msg.processed / msg.total) * 100) : 100;
-          el.progressBar.style.width = pct + '%';
-        } else if (msg.type === 'error') {
-          el.errorBox.style.display = 'block';
-          el.errorBox.textContent = 'Parse error: ' + msg.message;
-          el.progress.style.display = 'none';
-        } else if (msg.type === 'done') {
-          try {
-            const rawTeams = Array.isArray(msg.teams) ? msg.teams : [];
-            const rootRacers = Array.isArray(msg.rootRacers) ? msg.rootRacers : [];
-            const ingestedCount = msg.ingestedCount || rawTeams.length;
-            const rootMetaLast = msg.rootMetaLast || null;
-
-            const agg = buildAggregated(rawTeams, ingestedCount, rootMetaLast, rootRacers);
-
-            renderSummary(agg.meta);
-            renderRacerTeamRaces(agg.racers);
-            renderTenure(agg.racers);
-            renderActive(agg.racers);
-            renderTeamTotals(agg.teams);
-
-            enableSave(agg);
-            el.progressBar.style.width = '100%';
-            setTimeout(() => { el.progress.style.display = 'none'; }, 350);
-          } catch (e) {
-            el.errorBox.style.display = 'block';
-            el.errorBox.textContent = 'Render error: ' + (e.message || String(e));
-            el.progress.style.display = 'none';
-          }
-        }
-      };
-      w.postMessage({ text });
     }
+  };
+  w.postMessage({ text });
+}
 
-    // Bind
-    el.reloadBtn.addEventListener('click', loadAndRender);
-    el.saveBtn.addEventListener('click', saveAggregatedJSON);
+/* ----------------------- Bindings ----------------------- */
+el.reloadBtn.addEventListener('click', loadAndRender);
+el.saveBtn.addEventListener('click', saveAggregatedJSON);
 
-    // Auto-boot
-    loadAndRender();
-  </script>
+/* ----------------------- Auto-boot ----------------------- */
+loadAndRender();
+</script>
 </body>
 </html>
